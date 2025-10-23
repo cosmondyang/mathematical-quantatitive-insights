@@ -1,0 +1,294 @@
+你贴出来的这四个 top10_index_std 的 describe 其实已经暴露了“为什么看起来都像”的核心原因：
+在 N=4156 这么长的序列上，用全局排序去重排每一行的相似度向量（corrM[i,:]），top10_index_std 这种“Top10 在序列位置上的离散度”天然会靠近一个“几乎与排序方式无关的基线”。
+
+1) 为何会“看起来都像”？——有一个数学上的基线
+
+在你的实现里，top10_index_std 是这样算的（我用文字复述你代码）：
+
+对第 i 只股票，取 row = corrM[i, :]（这是一行：和所有股票的点积/相似度）。
+
+按某个全局排序 perm 重排这行（j = perm[t]），找出 Top10 的位置 top_poss[k] = t（注意：位置是 重排后的索引 t）。
+
+计算这些位置的标准差（用的是“总体方差”，除以 k_eff）：
+
+std
+=
+1
+𝑘
+∑
+𝑘
+(
+𝑝
+𝑘
+−
+𝑝
+ˉ
+)
+2
+std=
+k
+1
+	​
+
+k
+∑
+	​
+
+(p
+k
+	​
+
+−
+p
+ˉ
+	​
+
+)
+2
+	​
+
+
+如果某个排序 perm 和 row 没什么对齐关系（从 row 的视角看几乎是“随机顺序”），那 Top10 的位置就近似从 
+[
+0
+,
+𝑁
+−
+1
+]
+[0,N−1] 均匀抽样。
+这时 理论期望（对你这段代码的“总体方差”口径）是：
+
+𝐸
+[
+std
+]
+≈
+𝑘
+−
+1
+𝑘
+⋅
+𝑁
+2
+−
+1
+12
+E[std]≈
+k
+k−1
+	​
+
+⋅
+12
+N
+2
+−1
+	​
+
+	​
+
+
+代入你的规模 N=4156、k=10：
+
+(
+𝑁
+2
+−
+1
+)
+/
+12
+≈
+1,439,361.25
+(N
+2
+−1)/12≈1,439,361.25
+
+乘上 
+(
+𝑘
+−
+1
+)
+/
+𝑘
+=
+0.9
+(k−1)/k=0.9 再开方
+
+期望的 std ≈ 1138.17
+
+请看你四列的中位数（50%分位）：
+
+seq_vol_imbalance：1133.08（几乎精确贴着 1138 的随机基线）
+
+seq_max_buy_interarrival：921.40（比基线低一些）
+
+seq_identity：882.25（更低）
+
+seq_mean_buy_price：738.66（最低，说明更“聚团”）
+
+也就是说，这四种排序中，vol_imbalance 几乎对 row 来说像随机顺序；mean_buy_price 则能让 Top10 在序列上更聚集一些；identity 和 max_buy_interarrival 介于两者之间。
+所以它们**“不一样”**，只是都在一个很宽的基线附近，肉眼看 describe 会觉得“像”。
+
+另外，你的 min = 2.872281 这个数非常有意思：
+
+8.25
+=
+2.872281
+8.25
+	​
+
+=2.872281。这正好对应“Top10 在重排序列里是连续的10个位置（比如 0..9）”时的理论最小值 —— 这恰恰证明了代码确实在用排序，而且在某些样本上排序把 Top10 完全凑到了一起。
+
+2) 不是排序失效：是“全局排序 + 超长序列”的统计学效应
+
+你的排序 perm 是全局的（对所有 i 都用同一个 perm[k,:]），而 row=corrM[i,:] 是每只股票自己的“相似度画像”。
+如果这个全局排序与大多数 row 的“Top10 相似邻居”的“群落/行业/风格结构”没有强对齐，那从每个 row 的视角，perm 看起来就很接近“随机”。
+
+当 N=4156，top10_index_std 的随机基线就是 ~1138，你见到的几个排序不可能把绝大多数股票的 Top10 都“捏到一个很窄的区间”，于是各列 describe 就会都围着这个基线转，差有差，但都在同一个量级，人眼感觉“像”。
+
+你的四列其实已经体现了强弱对齐的差别：
+用基线标准化一下就很清楚（见下一节）。
+
+3) 一步“标准化”，肉眼立辨
+
+把每个 std 除以“随机基线 
+1138.17
+1138.17”得到聚团系数：
+
+cluster_ratio
+=
+1
+−
+std
+1138.17
+cluster_ratio=1−
+1138.17
+std
+	​
+
+
+接近 0：像随机顺序，Top10 在序列中散得很开；
+
+越大：Top10 越往某个区段扎堆（说明你的排序与该 row 的相似结构越对齐）。
+
+用你给的中位数举例（越大表示越“聚”）：
+
+序列	50%分位	cluster_ratio（越大越“聚”）
+mean_buy_price	738.66	0.351
+identity	882.25	0.225
+max_buy_interarrival	921.40	0.191
+vol_imbalance	1133.08	0.004（≈随机）
+
+这就能看出显著差异了：mean_buy_price 的排序最能把 Top10 挤在一起，vol_imbalance 几乎完全不像在帮助聚团。
+
+小片段（直接在你的 result_df 上跑）：
+
+import numpy as np
+N = 4156
+K = 10
+sd_uniform = np.sqrt((K-1)/K * (N**2 - 1) / 12.0)  # ≈ 1138.17
+cols = [
+  "buysellendcntimb_top10_index_std_seq_max_buy_interarrival_tick_none_time_none",
+  "buysellendcntimb_top10_index_std_seq_identity_tick_none_time_none",
+  "buysellendcntimb_top10_index_std_seq_mean_buy_price_tick_none_time_none",
+  "buysellendcntimb_top10_index_std_seq_vol_imbalance_tick_none_time_none",
+]
+for c in cols:
+    ratio = 1 - result_df[c] / sd_uniform
+    print(c, " median cluster_ratio=", ratio.median(), " mean cluster_ratio=", ratio.mean())
+
+4) 三个“立刻可跑”的自证 / 放大差异的方法
+A. 单行“极端对照”：用行内自排序做 sanity check（应趋近最小值 2.872…）
+
+对某只股票 i，用 它自己的 row 值降序排序（而不是全局排序），top10_index_std 应该接近最小值 ~2.872。
+如果这一步显著变小，说明你的排序机制有效，只是你当前那几个全局排序与实际相似结构没有特别对齐。
+
+def top10_index_std_for_row(row, perm):
+    # row: 1D, perm: 1D permutation of indices
+    # 返回与 numba 版本口径一致的 std
+    import numpy as np
+    n = perm.size
+    TOPK = 10
+    # 取重排后的位置和值
+    vals = row[perm]
+    # 找 top10 的位置（排除 self 的细节略过，这里做对照足够）
+    top_pos = np.argpartition(vals, -TOPK)[-TOPK:]
+    # 计算总体方差
+    m = top_pos.mean()
+    std = np.sqrt(((top_pos - m) ** 2).mean())
+    return std
+
+i = 0
+row = corrM[i, :]
+perm_row_desc = np.argsort(-row)   # 用“行内自排序”
+std_row_desc = top10_index_std_for_row(row, perm_row_desc)
+std_identity = top10_index_std_for_row(row, np.arange(len(row)))
+print(std_row_desc, std_identity)  # 前者应接近 2.872..., 后者接近 1138 基线
+
+B. “随机顺序”基线：给同一 row 随机打乱 perm，std 应靠近 1138
+rng = np.random.default_rng(0)
+perm_rand = rng.permutation(N)
+std_rand = top10_index_std_for_row(row, perm_rand)
+print("random perm std ~", std_rand)  # ≈ 1138
+
+C. 改相似度或改标准化（不改整个流程）
+
+你现在用的是 点积（Gram）：corrM = mat2 @ mat2.T，未做时间/截面 zscore 的版本 非常吃“强度”，会导致“Top10 常常就是一批强度大的股票”，与很多全局排序都呈“随机化”关系。
+两种不动大骨架的改法（只作 AB 试验）：
+
+tick_zscore + time_zscore：直接用你现成列里 tick_zscore_time_zscore 的版本比较 describe，差异会显著放大。
+
+余弦相似度：先把 mat2 的每行除以 L2 范数，再点积。等价代码：
+
+X = mat2 / (np.linalg.norm(mat2, axis=1, keepdims=True) + 1e-12)
+corrM = X @ X.T
+
+
+这一步能消掉强度的绝对量纲，让“形状”主导相似度。
+
+5) 让“序列敏感度”更强的参数小建议
+
+TopK 过小 vs N 很大：当 N=4156、K=10 时，“10 个点在 4000 多个位置上的离散度”天然会靠近随机基线。
+你可以试试 K=20 或 30（或者做多 K 的版本），差异更易显现。
+
+NEAR30、WIN20、OUTER=50 对 N=4156 显得太小（0.5%～1% 的序列长度）。
+可以考虑用相对规模：例如 NEAR = int(0.02*N)、WIN = int(0.01*N)、OUTER = int(0.05*N)，让“邻域/环”的覆盖比例随 N 缩放。
+
+多试你已经有的局部特征（比如 top10_index_span_norm, frac_top10_in_near30）：这些本来就比 mean_abs_grad_full 更“序列对齐敏感”。如果把 NEAR/ WIN 改成相对规模，差异会更明显。
+
+6) 排除“排序没生效”的快速检查清单
+
+打印 perms_2d 的前后 10 个元素，确认 每个 k 的 perm 都不同：
+
+for k in range(perms_2d.shape[0]):
+    p = perms_2d[k]
+    print(k, p[:10], "...", p[-10:])
+
+
+随机抽一个 i，在不同 perm 下把 Top10 的 (stock_id, position_in_perm, value) 打印出来，看位置是否确实不同：
+
+def debug_top10(row, perm, name):
+    vals = row[perm]
+    idx = np.argpartition(vals, -10)[-10:]
+    pos = np.sort(idx)
+    print(name, "top10 perm-positions:", pos, "std=", np.sqrt(((pos-pos.mean())**2).mean()))
+i = 0
+row = corrM[i,:]
+debug_top10(row, perms_2d[0], "identity")
+debug_top10(row, perms_2d[3], "mean_buy_price")
+debug_top10(row, perms_2d[4], "vol_imbalance")
+debug_top10(row, perms_2d[9], "max_buy_interarrival")
+
+
+你看到的 min = 2.872281 正是 10 个连续位置的理论最小值，这其实已经证明“重排生效”。
+
+一句话结论
+
+不是你的排序没用；是 N 很大 + 全局排序与大多数行的相似结构弱对齐 ⇒ top10_index_std、mean_abs_grad_full 这类“全轴/全域”统计会回到一个很强的随机基线附近。
+
+用基线标准化（如上 cluster_ratio）、改相似度为余弦/相关、增大 K/把窗口按 N 缩放，差异会立刻明显起来。
+
+你现在的四列其实已经有强弱差别：mean_buy_price 明显更聚，vol_imbalance 几乎随机；只是没经过基线归一化而显得“都差不多”。
